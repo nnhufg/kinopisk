@@ -1,3 +1,4 @@
+import redis
 import logging
 from typing import Any
 from django.core.management.base import BaseCommand
@@ -15,6 +16,7 @@ class Command(BaseCommand):
         logger = logging.getLogger(__name__)
 
         client = Elasticsearch('http://elasticsearch:9200', request_timeout=10)
+        rs = redis.Redis(host='redis', port=6379, decode_responses=True)
 
         index_name = 'movies'
         
@@ -110,19 +112,38 @@ class Command(BaseCommand):
                 logger.warning('\nИндекс уже существует!\n')
         except Exception as _e:
             logger.error(f'\nОшибка: {_e}\n')
+        
 
+        last_processed_id = rs.get('id')
+        if last_processed_id is not None:
+            last_processed_id = int(last_processed_id)
+        else:
+            last_processed_id = 0
 
         bulk_data = []
-        for film in Filmwork.objects.all():
-            bulk_data.append({
-                '_op_type': 'index', # указываем операцию
-                '_index': index_name, # указываем в какой индекс помещать документы
-                '_id': str(film.id), # обязательно приводим id к строке
-                '_source': { # указываем документ для помещения в индекс
-                    'title': film.title, 
-                    'description': film.description
-                }
-            })
+
+        try:
+            for film in Filmwork.objects.filter(id__gt=last_processed_id):
+                # сохраняем текущее состояние в redis
+                rs.set('id', str(film.id))
+                # получаем текущее состояние из redis и проверяем его
+                value =  rs.get('id')
+                if value == str(film.id):
+                    bulk_data.append({
+                        '_op_type': 'index', # указываем операцию
+                        '_index': index_name, # указываем в какой индекс помещать документы
+                        '_id': str(film.id), # обязательно приводим id к строке
+                        '_source': { # указываем документ для помещения в индекс
+                            'title': film.title, 
+                            'description': film.description
+                        }
+                    })
+            logger.info('\nФильмы успешно добавлены в массив!\n')
+        except Exception as _e:
+            logger.error(f'\nОшибка: {_e}\n')
+        finally:
+            rs.delete('id')
+            logger.info('\nКэш очищен!\n')
 
         try:
             bulk(client, bulk_data) # запускаем операцию c bulk
