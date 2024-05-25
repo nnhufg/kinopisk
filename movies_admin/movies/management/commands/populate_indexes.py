@@ -1,11 +1,13 @@
 import redis
 import logging
 from typing import Any
+from datetime import datetime
 from django.core.management.base import BaseCommand
 from movies.models import Filmwork
 from movies.documents import FilmWorkDocument
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk
+from .cache_redis import RedisStorage
 
 
 class Command(BaseCommand):
@@ -14,9 +16,18 @@ class Command(BaseCommand):
     def handle(self, *args: Any, **options: Any) -> str | None:
 
         logger = logging.getLogger(__name__)
+        now = datetime.now()
 
-        client = Elasticsearch('http://elasticsearch:9200', request_timeout=10)
-        rs = redis.Redis(host='redis', port=6379, decode_responses=True)
+        try:
+            client = Elasticsearch('http://elasticsearch:9200', request_timeout=10)
+        except Exception as _e:
+            logger.error(f'\nОшибка: {_e}\n')
+
+        try:
+            redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
+            redis_storage = RedisStorage(redis_client)
+        except Exception as _e:
+            logger.error(f'\nОшибка: {_e}\n')
 
         index_name = 'movies'
         
@@ -109,41 +120,34 @@ class Command(BaseCommand):
                 client.indices.create(index=index_name, body=body)
                 logger.info('\nИндекс успешно создан!\n')
             else:
-                logger.warning('\nИндекс уже существует!\n')
+                logger.info('\nИндекс уже существует!\n')
         except Exception as _e:
             logger.error(f'\nОшибка: {_e}\n')
-        
-
-        last_processed_id = rs.get('id')
-        if last_processed_id is not None:
-            last_processed_id = int(last_processed_id)
-        else:
-            last_processed_id = 0
 
         bulk_data = []
 
         try:
-            for film in Filmwork.objects.filter(id__gt=last_processed_id):
-                # сохраняем текущее состояние в redis
-                rs.set('id', str(film.id))
-                # получаем текущее состояние из redis и проверяем его
-                value =  rs.get('id')
-                if value == str(film.id):
-                    bulk_data.append({
-                        '_op_type': 'index', # указываем операцию
-                        '_index': index_name, # указываем в какой индекс помещать документы
-                        '_id': str(film.id), # обязательно приводим id к строке
-                        '_source': { # указываем документ для помещения в индекс
-                            'title': film.title, 
-                            'description': film.description
-                        }
-                    })
-            logger.info('\nФильмы успешно добавлены в массив!\n')
+            # Передаем все экземпляры в класс, где метод фильтрует их по кэшу
+            # То есть помещаем в Elasticsearch только актуальные экземпляры
+            instances = Filmwork.objects.all()
+            films = redis_storage.get_state(instances)
+            for film in films:
+                bulk_data.append({
+                    '_op_type': 'index', # указываем операцию
+                    '_index': index_name, # указываем в какой индекс помещать документы
+                    '_id': str(film.id), # обязательно приводим id к строке
+                    '_source': { # указываем документ для помещения в индекс
+                        'title': film.title, 
+                        'description': film.description
+                    }
+                })
+                film.modified = now.strftime('%Y-%m-%d %H:%M')
+                film.save()
+            redis_storage.set_state()
+            logger.warning('\nФильмы успешно добавлены в массив!\n')
         except Exception as _e:
             logger.error(f'\nОшибка: {_e}\n')
-        finally:
-            rs.delete('id')
-            logger.info('\nКэш очищен!\n')
+        
 
         try:
             bulk(client, bulk_data) # запускаем операцию c bulk
